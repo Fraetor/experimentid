@@ -1,136 +1,270 @@
-#!/usr/bin/env python3
+# Copyright (c) 2025, James Frost.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+"""Generate unique experiment identifiers."""
+
+import enum
+import json
+import sqlite3
 import time
-from typing import Literal
+from typing import Any
+
+__all__ = ["Parity", "IdentifierGenerator"]
 
 
-class exeID:
+class Parity(enum.Flag):
+    """Enum indicating odd or even. They can be ORed together to make any."""
+
+    ODD = enum.auto()
+    EVEN = enum.auto()
+    ANY = ODD | EVEN
+
+
+class IdentifierGenerator:
     """
-    TODO: Write docstring.
+    Generate unique sequential experiment identifiers.
 
-    IDs take the following format:
+    Identifiers take the following form: "25.2Q0PW"
 
-        25.2Q0PW
+    An identifier is made by concatenating the two digit current year with a dot
+    and a sequential counter encoded in a custom Base30 alphabet. This allows up
+    to 24,300,000 identifiers to be generated per year while maintaining a short
+    constant length.
 
-    The first part is the last two decimal digits of the year of creation,
-    followed by a sequential ID encoded in a custom Base30 alphabet. This allows
-    up to 24,300,000 IDs to be generated per year while maintaining a constant
-    length.
+    For resilience you should run two independent generation servers with
+    different parities. This prevent collisions by issuing odd identifiers from
+    one server and even identifiers from the other.
 
-    I considered adding an area or department section to the ID, but I can't see
-    how it would be determined automatically.
+    Parameters
+    ----------
+    database: sqlite3.Connection
+        Connection to the SQLite database for storing IDs and their metadata.
+    parity: Parity, optional
+        The parity of this instance. This prevents collisions when running a
+        pair of servers for resilience. Defaults to any parity.
 
-    For resilience you should be able to run two independent servers. To prevent
-    collisions, one server will issue odd ids, while the other will issue even
-    ids.
+    Notes
+    -----
+    The encoding alphabet we use is based on the Base25 alphabet used for Omega
+    Catalogue Identifiers by The National Archive.[1]_ It is based on arabic
+    numerals and the English alphabet, with visually ambiguous characters and
+    vowels removed. Only upper case letters are used to allow unambiguous verbal
+    communication. Vowels are removed to avoid forming any meaningful words.
 
-    Arguments
-    ---------
-    last_id
-        The last ID known to have been produced. The sequence will be restarted
-        after this ID.
+    An area or department code was considered in the identifier, but as it could
+    not be determined automatically, it has been omitted.
 
-    parity
-        The parity of this instance. This should be set when running a pair of
-        servers for resilience, as it prevents collisions.
+    References
+    ----------
+
+    .. [1] Retter, A., 2020. Archival Catalogue Record Identifiers. Down the
+        Code Mine [Online]. Available from:
+        https://blog.adamretter.org.uk/archival-catalog-identifiers/ [Accessed
+        20 July 2025].
+
+    Examples
+    --------
+    >>> import sqlite3
+    >>> from experimentid import IdentifierGenerator, Parity
+    >>> db = sqlite3.connect(":memory:")
+    >>> id_gen = IdentifierGenerator(db, Parity.ODD)
+    >>> id_gen.new()
+    "25.00001"
     """
 
-    # The encoding alphabet we use is based on the Base25 alphabet used for
-    # Omega Catalogue Identifiers by The National Archive. We are able to
-    # include a few additional characters that they exclude for reasons that
-    # don't affect us, to bring it up to a Base30 alphabet.
-    # https://blog.adamretter.org.uk/archival-catalog-identifiers/
-    # By avoiding vowels, there are essentially no words that can be made.
-    # (Confirmed by `grep -iv '[aeiou]' /usr/share/dict/words`)
     alphabet = "0123456789CDFGHJKLMNPQRSTVWXYZ"
-    counter: int
+    database: sqlite3.Connection
+    parity: Parity
     year: str
-    parity: Literal["even", "odd"] | None
+    counter: int
 
-    def __init__(
-        self, last_id: str = "00.00000", parity: Literal["even", "odd"] | None = None
-    ) -> None:
+    def __init__(self, database: sqlite3.Connection, parity: Parity = Parity.ANY):
+        # Initialise constant properties.
+        self.database = database
         self.parity = parity
-        self.year = time.strftime("%y")
-        # Reset the counter if the year is old, otherwise set the counter to
-        # just beyond its last value.
-        if last_id[:2] < self.year:
-            self.reset_counter()
-        elif last_id[:2] == self.year:
-            # Parse last_id for counter value.
-            counter = self.decode(last_id[3:])
-            # Increase counter so it is greater than the last counter value,
-            # maintaining parity.
-            is_even = counter % 2 == 0
-            if (self.parity == "even" and is_even) or (
-                self.parity == "odd" and not is_even
+
+        # Ensure we have our database table.
+        sql_create_table = """
+            CREATE TABLE IF NOT EXISTS experiment_ids (
+                id TEXT PRIMARY KEY NOT NULL,
+                metadata TEXT NOT NULL
+            )
+        """
+        self.database.execute(sql_create_table)
+        self.database.commit()
+
+        # Load last ID from database, with a fallback if there is no last ID.
+        sql_select_id = "SELECT id FROM experiment_ids ORDER BY id DESC LIMIT 1"
+        stored_id = self.database.execute(sql_select_id).fetchone()
+        last_id: str = stored_id[0] if stored_id is not None else "00.00000"
+
+        # Parse the ID into its constituent parts.
+        year, raw_counter = last_id.split(".")
+        counter = self._decode(raw_counter)
+
+        # Store the year and counter from the last ID. Storing an old value is
+        # not a problem, as they will be updated when the next ID is generated.
+        self.year = year
+        self.counter = counter
+
+    def new(self, metadata: dict[str, Any] = dict()) -> str:
+        """
+        Generate a new experiment ID.
+
+        Parameters
+        ----------
+        metadata: dict, optional
+            Metadata to associate with the new ID. Must be JSON serialisable.
+
+        Returns
+        -------
+        id: str
+            A unique experiment identifier.
+
+        Raises
+        ------
+        TypeError
+            If the metadata cannot be serialised as JSON.
+        ValueError
+            If the year has gone backwards, most likely due to the clock having
+            been changed, or this code still being in use after 2100.
+        """
+        # Reject JSON arrays and atoms.
+        if not isinstance(metadata, dict):
+            raise TypeError("Metadata is not a mapping.")
+        # Serialise metadata, ensuring it is normalised.
+        metadata_json = json.dumps(metadata, sort_keys=True)
+        # Generate a new ID.
+        new_id = self._next_id()
+        # Insert ID and metadata into database.
+        sql_insert_id = "INSERT INTO experiment_ids VALUES (?, ?)"
+        self.database.execute(sql_insert_id, (new_id, metadata_json))
+        self.database.commit()
+        return new_id
+
+    def _next_id(self) -> str:
+        """
+        Update the year and counter, returning the next identifier.
+
+        Returns
+        -------
+        next_id: str
+            The next ID.
+
+        Raises
+        ------
+        ValueError
+            If the year has gone backwards, most likely due to the clock having
+            been changed, or this code still being in use after 2100.
+        """
+        # Get current 2 digit UTC year.
+        year = time.strftime("%y", time.gmtime())
+        # Whether the year has changed determines how we update the counter.
+        if year == self.year:
+            # Year is unchanged. Increase the counter.
+            is_even = self.counter % 2 == 0
+            if (self.parity == Parity.EVEN and is_even) or (
+                self.parity == Parity.ODD and not is_even
             ):
-                self.counter = counter + 2
+                # Increase by two to maintain the parity of the counter.
+                self.counter = self.counter + 2
             else:
-                self.counter = counter + 1
-        else:
-            raise ValueError("Last ID was in the future! Check your clock.")
-
-    def new(self) -> str:
-        """Generate a new experiment ID."""
-        year = time.strftime("%y")
-        # Reset counter on year change.
-        if year != self.year:
+                # Increase by one when parity doesn't matter or the parity of
+                # the counter is different to the target parity.
+                self.counter = self.counter + 1
+        elif year > self.year:
+            # Year has increased. Update self.year and reset the counter.
             self.year = year
-            self.reset_counter()
-        counter = f"{self.encode(self.counter):0>5}"
-        self.increment_counter()
-        return f"{year}.{counter}"
-
-    def increment_counter(self):
-        """Increment the counter, maintaining parity."""
-        if self.parity is None:
-            self.counter += 1
+            # Enforce parity when resetting the counter.
+            self.counter = 0 if self.parity != Parity.ODD else 1
         else:
-            # Increase by two to maintain parity.
-            # E.g. 1 -> 3, or 2 -> 4.
-            self.counter += 2
+            raise ValueError("Year has gone backwards! Check your clock.")
+        # Encode and zero pad counter value.
+        encoded_counter = self._encode(self.counter).zfill(5)
+        # Construct ID from year and encoded counter.
+        new_id = f"{year}.{encoded_counter}"
+        return new_id
 
-    def reset_counter(self):
-        """Reset the counter, maintaining parity."""
-        if self.parity == "odd":
-            self.counter = 1
-        else:
-            self.counter = 0
+    def _encode(self, n: int) -> str:
+        """
+        Encode an integer in the custom Base30 alphabet.
 
-    @staticmethod
-    def encode(n: int) -> str:
-        """Encode an integer in the custom Base30 alphabet."""
+        Parameters
+        ----------
+        n: int
+            Positive integer to encode.
+
+        Returns
+        -------
+        encoded: str
+            String representation of encoded integer.
+
+        Raises
+        ------
+        ValueError
+            If n is not a positive integer.
+        """
         # Reject invalid values.
         if n < 0:
             raise ValueError("Only positive integers can be encoded.")
-        base = len(exeID.alphabet)
+        base = len(self.alphabet)
+        # Special case to handle encoding 0.
+        result = self.alphabet[0] if n == 0 else ""
         # Build up the result string from the least significant digit.
-        result = ""
         while n > 0:
             n, remainder = divmod(n, base)
-            # Prepend character onto result string.
-            result = exeID.alphabet[remainder] + result
+            # Prepend character onto result string. This technically makes this
+            # encoding O(n^2) due to repeated string concatenations, but we are
+            # not dealing with large enough integers for it to be problematic.
+            result = self.alphabet[remainder] + result
         return result
 
-    @staticmethod
-    def decode(s: str) -> int:
-        """Decode an integer from the custom Base30 alphabet."""
-        base = len(exeID.alphabet)
+    def _decode(self, s: str) -> int:
+        """
+        Decode an integer from the custom Base30 alphabet.
+
+        Parameters
+        ----------
+        s: str
+            Encoded integer to decode.
+
+        Returns
+        -------
+        decoded: int
+            Native int representation of decoded integer
+
+        Raises
+        ------
+        ValueError
+            If s contains characters outside of the allowed alphabet.
+        """
+        base = len(self.alphabet)
         accumulator = 0
         for order, character in enumerate(reversed(s)):
-            idx = exeID.alphabet.index(character)
-            accumulator += idx * base**order
+            index = self.alphabet.index(character)
+            accumulator += index * base**order
         return accumulator
-
-
-if __name__ == "__main__":
-    import sys
-
-    try:
-        count = int(sys.argv[1])
-    except (ValueError, IndexError):
-        count = 1
-    id_generator = exeID(last_id="25.12345")
-    for _ in range(count):
-        print(id_generator.new())
